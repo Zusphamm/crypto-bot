@@ -1,0 +1,8 @@
+pandas>=2.0
+numpy>=1.24
+requests>=2.28
+scipy>=1.10
+hmmlearn>=0.3
+pykalman>=0.9.5
+python-telegram-bot[job-queue]>=20.0
+python-dotenv>=1.0

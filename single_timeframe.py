@@ -1,0 +1,296 @@
+"""
+===============================================================================
+ SINGLE-TIMEFRAME TREND ANALYZER
+===============================================================================
+ Phân tích xu hướng cho 1 khung thời gian duy nhất bằng cách ENSEMBLE
+ nhiều model, theo triết lý "Ensemble luôn thắng single model" của file md
+ (Key Takeaway #4).
+
+ Mỗi model sinh ra 1 "vote" ∈ {-1, 0, +1} và 1 confidence weight.
+ Xác suất cuối cùng được tính bằng weighted softmax.
+
+ Các model được dùng (mapping tới section file md):
+   - MA Alignment        (Section 1.2)
+   - Market Structure    (Section 1.2)
+   - Ichimoku            (Section 1.2)
+   - RSI / MACD          (classical momentum)
+   - HMM regime          (Section 7)
+   - Kalman velocity     (Section 9)
+   - Hurst + trend sign  (Section 8)
+   - Bollinger position  (mean-reversion filter)
+===============================================================================
+"""
+from typing import Dict, List
+
+import numpy as np
+import pandas as pd
+
+from indicators import (
+    ema, rsi, macd, atr, bollinger, ichimoku, ichimoku_signal,
+    market_structure, ma_alignment_score,
+)
+from advanced_algorithms import (
+    hmm_regime_detection, kalman_signal, rolling_hurst_signal,
+)
+
+
+# -----------------------------------------------------------------------------
+# Helper: vote + weight
+# -----------------------------------------------------------------------------
+
+def _rsi_vote(close: pd.Series) -> Dict:
+    r = rsi(close, 14).iloc[-1]
+    if pd.isna(r):
+        return {"vote": 0, "weight": 0.0, "rsi": None}
+    # Giữ đúng nguyên tắc: RSI > 50 bias bullish, < 50 bias bearish
+    # Cực trị > 70 (quá mua) hoặc < 30 (quá bán) → hạ trọng số vì dễ đảo chiều
+    if r > 70:
+        return {"vote": 1, "weight": 0.5, "rsi": float(r), "note": "overbought"}
+    if r < 30:
+        return {"vote": -1, "weight": 0.5, "rsi": float(r), "note": "oversold"}
+    if r > 55:
+        return {"vote": 1, "weight": 1.0, "rsi": float(r)}
+    if r < 45:
+        return {"vote": -1, "weight": 1.0, "rsi": float(r)}
+    return {"vote": 0, "weight": 0.5, "rsi": float(r)}
+
+
+def _macd_vote(close: pd.Series) -> Dict:
+    m, s, h = macd(close)
+    if len(h) < 2 or pd.isna(h.iloc[-1]):
+        return {"vote": 0, "weight": 0.0}
+
+    cross_up = h.iloc[-1] > 0 and h.iloc[-2] <= 0
+    cross_dn = h.iloc[-1] < 0 and h.iloc[-2] >= 0
+
+    if cross_up:
+        return {"vote": 1, "weight": 1.5, "macd_hist": float(h.iloc[-1]),
+                "note": "bullish_cross"}
+    if cross_dn:
+        return {"vote": -1, "weight": 1.5, "macd_hist": float(h.iloc[-1]),
+                "note": "bearish_cross"}
+    if h.iloc[-1] > 0:
+        return {"vote": 1, "weight": 0.8, "macd_hist": float(h.iloc[-1])}
+    return {"vote": -1, "weight": 0.8, "macd_hist": float(h.iloc[-1])}
+
+
+def _bollinger_vote(df: pd.DataFrame) -> Dict:
+    lo, mid, up = bollinger(df["close"])
+    if pd.isna(up.iloc[-1]):
+        return {"vote": 0, "weight": 0.0}
+
+    close = df["close"].iloc[-1]
+    if close > up.iloc[-1]:
+        # Phá biên trên → 2 khả năng: breakout bullish HOẶC overextended
+        # Dùng trọng số nhỏ và cho vote trung tính
+        return {"vote": 0, "weight": 0.3, "position": "above_upper"}
+    if close < lo.iloc[-1]:
+        return {"vote": 0, "weight": 0.3, "position": "below_lower"}
+    if close > mid.iloc[-1]:
+        return {"vote": 1, "weight": 0.5, "position": "upper_half"}
+    return {"vote": -1, "weight": 0.5, "position": "lower_half"}
+
+
+def _ma_alignment_vote(close: pd.Series) -> Dict:
+    info = ma_alignment_score(close)
+    score = info["score"]
+    if score >= 2:
+        return {"vote": 1, "weight": 2.0, **info}
+    if score == 1:
+        return {"vote": 1, "weight": 1.2, **info}
+    if score <= -2:
+        return {"vote": -1, "weight": 2.0, **info}
+    if score == -1:
+        return {"vote": -1, "weight": 1.2, **info}
+    return {"vote": 0, "weight": 0.3, **info}
+
+
+def _structure_vote(df: pd.DataFrame) -> Dict:
+    info = market_structure(df, lookback=5)
+    trend = info["trend"]
+    if trend == "uptrend":
+        vote, weight = 1, 1.5
+    elif trend == "downtrend":
+        vote, weight = -1, 1.5
+    else:
+        vote, weight = 0, 0.4
+
+    # BOS tăng trọng số
+    if info.get("bos") and info.get("bos_direction") == "bullish":
+        vote, weight = 1, weight + 0.8
+    elif info.get("bos") and info.get("bos_direction") == "bearish":
+        vote, weight = -1, weight + 0.8
+
+    return {"vote": vote, "weight": weight, **info}
+
+
+def _ichimoku_vote(df: pd.DataFrame) -> Dict:
+    icm = ichimoku(df)
+    sig = ichimoku_signal(df, icm)
+    if sig == 1:
+        return {"vote": 1, "weight": 1.5, "status": "above_cloud_bullish"}
+    if sig == -1:
+        return {"vote": -1, "weight": 1.5, "status": "below_cloud_bearish"}
+    return {"vote": 0, "weight": 0.5, "status": "inside_cloud"}
+
+
+def _hmm_vote(df: pd.DataFrame) -> Dict:
+    info = hmm_regime_detection(df)
+    if "error" in info:
+        return {"vote": 0, "weight": 0.0, **info}
+    regime = info["current_regime"]
+    prob = info["regime_probability"]
+
+    # Trọng số tỉ lệ với xác suất posterior (càng chắc chắn càng nặng)
+    weight = 2.0 * prob  # 2.0 là trần khi prob = 1.0
+
+    if regime == "Bull":
+        vote = 1
+    elif regime == "Bear":
+        vote = -1
+    else:
+        vote = 0
+        weight *= 0.3  # sideway → giảm trọng số vì không có hướng rõ
+
+    return {
+        "vote": vote,
+        "weight": weight,
+        "regime": regime,
+        "probability": prob,
+    }
+
+
+def _kalman_vote(df: pd.DataFrame) -> Dict:
+    info = kalman_signal(df)
+    sig = info["signal"]
+    strength = info.get("trend_strength", 0.0)
+
+    # Trọng số tỉ lệ với trend strength, cap ở 2.0
+    weight = min(2.0, 50.0 * strength + 0.5)
+
+    return {"vote": sig, "weight": weight, **info}
+
+
+def _hurst_vote(df: pd.DataFrame) -> Dict:
+    """
+    Hurst bản thân nó không nói hướng — nó nói xu hướng có tiếp diễn hay đảo chiều.
+    Ta kết hợp Hurst với dấu của return gần đây:
+       H > 0.55 + return dương  → mạnh tin tiếp tục tăng
+       H > 0.55 + return âm     → mạnh tin tiếp tục giảm
+       H < 0.45                 → tín hiệu đảo chiều (giảm trọng số xu hướng)
+    """
+    info = rolling_hurst_signal(df)
+    h = info["hurst"]
+
+    recent_ret = df["close"].pct_change(20).iloc[-1]
+    if pd.isna(recent_ret) or abs(recent_ret) < 1e-6:
+        return {"vote": 0, "weight": 0.1, **info}
+
+    if h > 0.55:
+        vote = 1 if recent_ret > 0 else -1
+        weight = 1.5 * min(1.0, (h - 0.5) * 4)
+    elif h < 0.45:
+        # Anti-persistent → vote NGƯỢC hướng hiện tại (mean revert)
+        vote = -1 if recent_ret > 0 else 1
+        weight = 0.8 * min(1.0, (0.5 - h) * 4)
+    else:
+        vote = 0
+        weight = 0.1
+
+    return {"vote": vote, "weight": weight, **info}
+
+
+# -----------------------------------------------------------------------------
+# Main single-timeframe analyzer
+# -----------------------------------------------------------------------------
+
+def analyze_timeframe(
+    df: pd.DataFrame, timeframe_label: str = "",
+) -> Dict:
+    """
+    Chạy tất cả model trên 1 khung và trả về:
+        - dict các vote chi tiết
+        - xác suất {up, down, neutral}
+        - conclusion string
+        - key levels (swing high/low, EMA, ATR)
+    """
+    if len(df) < 50:
+        return {
+            "timeframe": timeframe_label,
+            "error": f"Cần ≥ 50 nến, chỉ có {len(df)}",
+            "probabilities": {"up": 0.33, "down": 0.33, "neutral": 0.34},
+        }
+
+    votes: Dict[str, Dict] = {
+        "ma_alignment": _ma_alignment_vote(df["close"]),
+        "market_structure": _structure_vote(df),
+        "ichimoku": _ichimoku_vote(df),
+        "rsi": _rsi_vote(df["close"]),
+        "macd": _macd_vote(df["close"]),
+        "bollinger": _bollinger_vote(df),
+        "hmm_regime": _hmm_vote(df),
+        "kalman_trend": _kalman_vote(df),
+        "hurst_memory": _hurst_vote(df),
+    }
+
+    # Weighted sum
+    score_up = 0.0
+    score_down = 0.0
+    score_neutral = 0.0
+    total_weight = 0.0
+
+    for name, v in votes.items():
+        w = v.get("weight", 0.0)
+        total_weight += w
+        if v["vote"] > 0:
+            score_up += w
+        elif v["vote"] < 0:
+            score_down += w
+        else:
+            score_neutral += w
+
+    if total_weight == 0:
+        probs = {"up": 1/3, "down": 1/3, "neutral": 1/3}
+    else:
+        probs = {
+            "up": score_up / total_weight,
+            "down": score_down / total_weight,
+            "neutral": score_neutral / total_weight,
+        }
+
+    # Kết luận
+    top_dir = max(probs, key=probs.get)
+    top_prob = probs[top_dir]
+    if top_prob > 0.60:
+        strength = "strong"
+    elif top_prob > 0.45:
+        strength = "moderate"
+    else:
+        strength = "weak"
+
+    # Key levels
+    close = df["close"].iloc[-1]
+    atr14 = atr(df["high"], df["low"], df["close"], 14).iloc[-1]
+    ema20 = ema(df["close"], 20).iloc[-1]
+    ema50 = ema(df["close"], 50).iloc[-1]
+    ema200 = ema(df["close"], 200).iloc[-1] if len(df) > 200 else None
+
+    return {
+        "timeframe": timeframe_label,
+        "n_candles": len(df),
+        "last_close": float(close),
+        "last_time": str(df.index[-1]),
+        "probabilities": probs,
+        "direction": top_dir,
+        "strength": strength,
+        "conclusion": f"{strength}_{top_dir}",
+        "votes": votes,
+        "key_levels": {
+            "ema_20": float(ema20),
+            "ema_50": float(ema50),
+            "ema_200": float(ema200) if ema200 else None,
+            "atr_14": float(atr14) if not pd.isna(atr14) else None,
+            "last_swing_high": votes["market_structure"].get("last_swing_high"),
+            "last_swing_low": votes["market_structure"].get("last_swing_low"),
+        },
+    }
