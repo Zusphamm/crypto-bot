@@ -33,8 +33,8 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
 from dotenv import load_dotenv
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from telegram.constants import ParseMode
 
 # Ensure local imports work
@@ -121,9 +121,15 @@ async def _run_analysis_async(
         return {"symbol": symbol, "result": None, "error": f"Timeout ({timeout}s)"}
 
 
-# ─── Message formatters ──────────────────────────────────────────────────────
+# ─── Message formatters (Rich UX) ────────────────────────────────────────────
 
 _DIR_EMOJI = {"up": "🟢", "down": "🔴", "neutral": "⚪"}
+_CONFIDENCE_EMOJI = {
+    "high": "🔥", "medium": "💡", "low": "❄️",
+}
+_STRENGTH_EMOJI = {
+    "strong": "💪", "moderate": "👍", "weak": "🤏",
+}
 
 
 def _get_price(result: Dict) -> str:
@@ -134,79 +140,118 @@ def _get_price(result: Dict) -> str:
     return "?"
 
 
+def _prob_bar(pct: float, width: int = 10) -> str:
+    """Visual probability bar: ████████░░ 80%"""
+    filled = round(pct * width)
+    empty = width - filled
+    return "█" * filled + "░" * empty + f" {pct*100:.0f}%"
+
+
+def _confidence_level(prob: float) -> str:
+    if prob >= 0.65:
+        return "high"
+    if prob >= 0.50:
+        return "medium"
+    return "low"
+
+
 def format_symbol_line(symbol: str, result: Dict) -> str:
-    """One-liner for scan summary."""
+    """Rich one-liner for scan summary."""
     overall = result.get("overall", {})
     if "error" in overall:
         return f"⚠️ {symbol}: {overall['error']}"
 
     d = overall.get("overall_direction", "neutral")
     prob = overall.get("weighted_probabilities", {})
+    top_p = prob.get(d, 0)
     hq = " ⭐" if overall.get("high_quality_setup") else ""
-    htf = overall.get("higher_tf_direction", "?")
-    mtf = overall.get("middle_tf_direction", "?")
-    ltf = overall.get("lower_tf_direction", "?")
+    conf = _confidence_level(top_p)
+    conf_emoji = _CONFIDENCE_EMOJI.get(conf, "")
+    htf = _DIR_EMOJI.get(overall.get("higher_tf_direction", "?"), "❓")
+    mtf = _DIR_EMOJI.get(overall.get("middle_tf_direction", "?"), "❓")
+    ltf = _DIR_EMOJI.get(overall.get("lower_tf_direction", "?"), "❓")
     price = _get_price(result)
 
     return (
-        f"{_DIR_EMOJI.get(d, '❓')} <b>{symbol}</b>{hq}\n"
-        f"   {price}  UP:{prob.get('up',0)*100:.0f}% DN:{prob.get('down',0)*100:.0f}%"
-        f"  H:{htf} M:{mtf} L:{ltf}"
+        f"{_DIR_EMOJI.get(d, '❓')} <b>{symbol}</b> {price}{hq} {conf_emoji}\n"
+        f"   {_prob_bar(prob.get('up',0))} UP\n"
+        f"   {_prob_bar(prob.get('down',0))} DN\n"
+        f"   TFs: {htf}{mtf}{ltf}"
     )
 
 
 def format_full_report(symbol: str, result: Dict) -> str:
-    """Detailed report for /analyze."""
+    """Rich detailed report for /analyze."""
     overall = result.get("overall", {})
     if "error" in overall:
         return f"⚠️ {symbol}: {overall['error']}"
 
-    d = overall.get("overall_direction", "?").upper()
+    d = overall.get("overall_direction", "?")
+    d_upper = d.upper()
     prob = overall.get("weighted_probabilities", {})
-    hq = "⭐ HIGH QUALITY" if overall.get("high_quality_setup") else ""
+    top_p = prob.get(d, 0)
+    hq = "⭐ <b>HIGH QUALITY SETUP</b>" if overall.get("high_quality_setup") else ""
     n_edge = overall.get("n_timeframes_with_edge", 0)
     n_total = overall.get("n_timeframes_total", 0)
+    conf = _confidence_level(top_p)
+    conf_emoji = _CONFIDENCE_EMOJI.get(conf, "")
 
     lines = [
-        f"{'=' * 38}",
-        f"{_DIR_EMOJI.get(d.lower(), '❓')} <b>{symbol}</b> — {d} {hq}",
-        f"{'=' * 38}",
-        "",
-        "<b>Probabilities:</b>",
-        f"  UP:      {prob.get('up',0)*100:.1f}%",
-        f"  DOWN:    {prob.get('down',0)*100:.1f}%",
-        f"  NEUTRAL: {prob.get('neutral',0)*100:.1f}%",
-        "",
-        "<b>Top-Down Confluence:</b>",
-        f"  Higher (4h-12h): {overall.get('higher_tf_direction','?')}"
-        f" ({overall.get('higher_tf_agreement',0)*100:.0f}% agree)",
-        f"  Middle (1h-2h):  {overall.get('middle_tf_direction','?')}"
-        f" ({overall.get('middle_tf_agreement',0)*100:.0f}% agree)",
-        f"  Lower  (≤30m):   {overall.get('lower_tf_direction','?')}"
-        f" ({overall.get('lower_tf_agreement',0)*100:.0f}% agree)",
-        f"  Edge TFs: {n_edge}/{n_total}",
-        "",
+        f"{'━' * 30}",
+        f"{_DIR_EMOJI.get(d, '❓')} <b>{symbol}</b> — {d_upper} {conf_emoji}",
+        f"{'━' * 30}",
     ]
+    if hq:
+        lines.append(hq)
+    lines.append("")
+
+    # Probability bars
+    lines.append("📊 <b>Probability</b>")
+    lines.append(f"  🟢 UP   {_prob_bar(prob.get('up',0))}")
+    lines.append(f"  🔴 DOWN {_prob_bar(prob.get('down',0))}")
+    lines.append(f"  ⚪ FLAT {_prob_bar(prob.get('neutral',0))}")
+    lines.append("")
+
+    # Confluence
+    h_dir = overall.get("higher_tf_direction", "?")
+    m_dir = overall.get("middle_tf_direction", "?")
+    l_dir = overall.get("lower_tf_direction", "?")
+    lines.append("🔍 <b>Top-Down Confluence</b>")
+    lines.append(
+        f"  {_DIR_EMOJI.get(h_dir,'❓')} Higher (4h-12h): <b>{h_dir}</b>"
+        f" ({overall.get('higher_tf_agreement',0)*100:.0f}%)"
+    )
+    lines.append(
+        f"  {_DIR_EMOJI.get(m_dir,'❓')} Middle  (1h-2h): <b>{m_dir}</b>"
+        f" ({overall.get('middle_tf_agreement',0)*100:.0f}%)"
+    )
+    lines.append(
+        f"  {_DIR_EMOJI.get(l_dir,'❓')} Lower   (≤30m): <b>{l_dir}</b>"
+        f" ({overall.get('lower_tf_agreement',0)*100:.0f}%)"
+    )
+    lines.append(f"  📈 Edge TFs: <b>{n_edge}/{n_total}</b>")
+    lines.append("")
 
     # Per-timeframe
     per_tf = result.get("per_timeframe", {})
-    lines.append("<b>Per Timeframe:</b>")
+    lines.append("📋 <b>Per Timeframe</b>")
     for tf, info in per_tf.items():
         if "error" in info:
-            lines.append(f"  [{tf:>4}] ❌ {info['error']}")
+            lines.append(f"  ❌ <code>{tf:>4}</code> {info['error']}")
             continue
         p = info.get("probabilities", {})
         td = info.get("direction", "?")
         ts = info.get("strength", "?")
+        s_emoji = _STRENGTH_EMOJI.get(ts, "")
         cal = info.get("calibrated", {})
         edge_txt = ""
         if cal.get("edge_vs_baseline") is not None:
             e = cal["edge_vs_baseline"]
-            marker = "✓" if cal.get("has_edge") else "✗"
-            edge_txt = f" edge={e*100:+.1f}%{marker}"
+            marker = "✅" if cal.get("has_edge") else "❌"
+            edge_txt = f" {marker}{e*100:+.1f}%"
         lines.append(
-            f"  {_DIR_EMOJI.get(td,'❓')} [{tf:>4}] {ts}_{td}"
-            f"  UP:{p.get('up',0)*100:.0f}% DN:{p.get('down',0)*100:.0f}%{edge_txt}"
+            f"  {_DIR_EMOJI.get(td,'❓')} <code>{tf:>4}</code> {s_emoji}"
+            f" UP:{p.get('up',0)*100:.0f}% DN:{p.get('down',0)*100:.0f}%{edge_txt}"
         )
 
     lines.append("")
@@ -217,29 +262,53 @@ def format_full_report(symbol: str, result: Dict) -> str:
     for tf_key in ["4h", "1h"]:
         if tf_key in per_tf and "key_levels" in per_tf[tf_key]:
             kl = per_tf[tf_key]["key_levels"]
-            lines.append(f"\n<b>Key Levels ({tf_key}):</b>")
+            lines.append(f"\n📍 <b>Key Levels ({tf_key})</b>")
             if kl.get("ema_20") is not None:
-                lines.append(f"  EMA20:  ${kl['ema_20']:,.2f}")
+                lines.append(f"  EMA20:  <code>${kl['ema_20']:,.2f}</code>")
             if kl.get("ema_50") is not None:
-                lines.append(f"  EMA50:  ${kl['ema_50']:,.2f}")
+                lines.append(f"  EMA50:  <code>${kl['ema_50']:,.2f}</code>")
             if kl.get("ema_200") is not None:
-                lines.append(f"  EMA200: ${kl['ema_200']:,.2f}")
+                lines.append(f"  EMA200: <code>${kl['ema_200']:,.2f}</code>")
             if kl.get("atr_14") is not None:
-                lines.append(f"  ATR14:  ${kl['atr_14']:,.2f}")
+                lines.append(f"  ATR14:  <code>${kl['atr_14']:,.2f}</code>")
             break
+
+    lines.append("")
+    lines.append(f"<i>⚠️ Not financial advice. Model max confidence capped at 85%.</i>")
 
     return "\n".join(lines)
 
 
+# ─── Inline keyboards ────────────────────────────────────────────────────────
+
+def _analyze_keyboard(symbol: str) -> InlineKeyboardMarkup:
+    """Inline buttons after /analyze result."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📈 Chart", callback_data=f"chart:{symbol}"),
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh:{symbol}"),
+        ],
+        [
+            InlineKeyboardButton("📋 Details", callback_data=f"details:{symbol}"),
+            InlineKeyboardButton("🔔 Alert", callback_data=f"alert_set:{symbol}"),
+        ],
+    ])
+
+
 # ─── Telegram helpers ─────────────────────────────────────────────────────────
 
-async def _send_long(target, text: str, parse_mode=ParseMode.HTML):
-    """Send a message, splitting into chunks if > 4096 chars."""
+async def _send_long(target, text: str, parse_mode=ParseMode.HTML, keyboard=None):
+    """Send a message, splitting into chunks if > 4096 chars. Last chunk gets keyboard."""
     chunks = [text[i : i + 4000] for i in range(0, len(text), 4000)]
     for idx, chunk in enumerate(chunks):
-        await target.reply_text(chunk, parse_mode=parse_mode)
-        if idx < len(chunks) - 1:
-            await asyncio.sleep(0.5)  # rate limit between chunks
+        is_last = idx == len(chunks) - 1
+        await target.reply_text(
+            chunk,
+            parse_mode=parse_mode,
+            reply_markup=keyboard if is_last else None,
+        )
+        if not is_last:
+            await asyncio.sleep(0.5)
 
 
 async def _send_to_chat(bot, chat_id, text: str):
@@ -281,7 +350,8 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Quick scan all tracked coins."""
     universe = context.bot_data.get("universe", DEFAULT_UNIVERSE.copy())
     await update.message.reply_text(
-        f"🔍 Scanning {len(universe)} coins on {QUICK_TFS}… (a few minutes)"
+        f"🔍 Scanning <b>{len(universe)}</b> coins on {QUICK_TFS}… (a few minutes)",
+        parse_mode=ParseMode.HTML,
     )
 
     ups, downs, neutrals, errors, alerts = [], [], [], [], []
@@ -335,9 +405,12 @@ async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Full analysis for one coin."""
+    """Full analysis for one coin with progress indicators + inline keyboard."""
     if not context.args:
-        await update.message.reply_text("Usage: /analyze BTCUSDT [-b for backtest]")
+        await update.message.reply_text(
+            "Usage: /analyze BTCUSDT [-b for backtest]",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     symbol = context.args[0].upper()
@@ -346,18 +419,66 @@ async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     run_bt = "-b" in context.args or "--backtest" in context.args
     bt_label = " + backtest" if run_bt else ""
-    await update.message.reply_text(
-        f"🔍 Analyzing <b>{symbol}</b> (all 11 TFs{bt_label})… please wait",
+
+    # Progress message — edit in-place as each step completes
+    progress_msg = await update.message.reply_text(
+        f"🔍 <b>Analyzing {symbol}</b>{bt_label}\n\n"
+        f"⏳ Step 1/3 — Fetching market data…",
         parse_mode=ParseMode.HTML,
     )
+
+    # Step 1: Start analysis
+    try:
+        await progress_msg.edit_text(
+            f"🔍 <b>Analyzing {symbol}</b>{bt_label}\n\n"
+            f"✅ Step 1/3 — Data fetched\n"
+            f"⏳ Step 2/3 — Running {len(FULL_TFS)} timeframe analysis…",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass  # edit may fail if too fast
 
     res = await _run_analysis_async(symbol, FULL_TFS, run_bt, timeout=300)
 
     if res["error"]:
-        await update.message.reply_text(f"❌ {res['error']}")
+        try:
+            await progress_msg.edit_text(
+                f"❌ <b>{symbol}</b>: {res['error']}",
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await update.message.reply_text(
+                f"❌ {res['error']}", parse_mode=ParseMode.HTML,
+            )
         return
 
-    await _send_long(update.message, format_full_report(symbol, res["result"]))
+    # Step 3: Format and send
+    try:
+        await progress_msg.edit_text(
+            f"🔍 <b>Analyzing {symbol}</b>{bt_label}\n\n"
+            f"✅ Step 1/3 — Data fetched\n"
+            f"✅ Step 2/3 — Analysis complete\n"
+            f"⏳ Step 3/3 — Generating report…",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    # Store result for callback buttons
+    context.bot_data[f"last_result:{symbol}"] = res
+
+    report = format_full_report(symbol, res["result"])
+    keyboard = _analyze_keyboard(symbol)
+
+    # Delete progress message, send final report with keyboard
+    try:
+        await progress_msg.delete()
+    except Exception:
+        pass
+
+    await _send_long(
+        update.message, report, keyboard=keyboard,
+    )
 
 
 async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -476,6 +597,128 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  Status: Running ✅"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
+
+# ─── Callback handler for inline buttons ─────────────────────────────────────
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button presses."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    action, symbol = data.split(":", 1)
+
+    if action == "chart":
+        await query.edit_message_reply_markup(reply_markup=None)
+        progress = await query.message.reply_text(
+            f"📈 Generating chart for <b>{symbol}</b>…",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            from charts import generate_price_chart
+            res = context.bot_data.get(f"last_result:{symbol}")
+            if res and res.get("result"):
+                # Re-fetch data for chart
+                loop = asyncio.get_event_loop()
+                chart_data = await loop.run_in_executor(
+                    executor, partial(
+                        _run_analysis, symbol, ["1h"], False, 500
+                    )
+                )
+                if chart_data and chart_data.get("result"):
+                    per_tf = chart_data["result"].get("per_timeframe", {})
+                    tf_key = next(iter(per_tf), None)
+                    if tf_key:
+                        # Get key levels from cached result
+                        cached_overall = res["result"].get("overall", {})
+                        cached_per_tf = res["result"].get("per_timeframe", {})
+                        key_levels = None
+                        for ktf in ["4h", "1h"]:
+                            if ktf in cached_per_tf and "key_levels" in cached_per_tf[ktf]:
+                                key_levels = cached_per_tf[ktf]["key_levels"]
+                                break
+
+                        # generate_price_chart needs OHLCV data
+                        # We fetch it separately for chart
+                        from binance_fetcher import fetch_all_timeframes
+                        ohlcv_data = await loop.run_in_executor(
+                            executor, partial(
+                                fetch_all_timeframes,
+                                symbol=symbol,
+                                intervals=["1h"],
+                                max_candles=200,
+                                max_years=0.1,
+                                market="spot",
+                                verbose=False,
+                            )
+                        )
+                        if "1h" in ohlcv_data and ohlcv_data["1h"] is not None:
+                            chart_path = generate_price_chart(
+                                ohlcv_data["1h"], symbol, key_levels=key_levels,
+                            )
+                            await progress.delete()
+                            with open(chart_path, "rb") as f:
+                                await query.message.reply_photo(
+                                    photo=f,
+                                    caption=f"📈 {symbol} 1H Chart",
+                                )
+                            os.remove(chart_path)
+                            return
+            await progress.edit_text("❌ No data available for chart")
+        except ImportError:
+            await progress.edit_text("❌ Chart module not available (install matplotlib)")
+        except Exception as e:
+            logger.error(f"Chart error: {e}")
+            await progress.edit_text(f"❌ Chart error: {e}")
+
+    elif action == "refresh":
+        await query.edit_message_reply_markup(reply_markup=None)
+        progress = await query.message.reply_text(
+            f"🔄 Refreshing <b>{symbol}</b>…",
+            parse_mode=ParseMode.HTML,
+        )
+        res = await _run_analysis_async(symbol, FULL_TFS, False, timeout=300)
+        await progress.delete()
+        if res["error"]:
+            await query.message.reply_text(
+                f"❌ {res['error']}", parse_mode=ParseMode.HTML,
+            )
+        else:
+            context.bot_data[f"last_result:{symbol}"] = res
+            report = format_full_report(symbol, res["result"])
+            keyboard = _analyze_keyboard(symbol)
+            await _send_long(query.message, report, keyboard=keyboard)
+
+    elif action == "details":
+        res = context.bot_data.get(f"last_result:{symbol}")
+        if not res or not res.get("result"):
+            await query.message.reply_text("❌ No cached data. Run /analyze again.")
+            return
+        # Show per-model vote details
+        per_tf = res["result"].get("per_timeframe", {})
+        lines = [f"📋 <b>{symbol} — Model Votes Detail</b>\n"]
+        for tf, info in per_tf.items():
+            if "error" in info or "votes" not in info:
+                continue
+            lines.append(f"\n<b>[{tf}]</b>")
+            for model, v in info["votes"].items():
+                vote = v.get("vote", 0)
+                weight = v.get("weight", 0.0)
+                v_emoji = "🟢" if vote > 0 else ("🔴" if vote < 0 else "⚪")
+                lines.append(f"  {v_emoji} {model}: vote={vote:+d} w={weight:.1f}")
+            # Only show first 3 TFs to avoid message limit
+            if len(lines) > 60:
+                lines.append("\n<i>… truncated (showing top TFs)</i>")
+                break
+        await _send_long(query.message, "\n".join(lines))
+
+    elif action == "alert_set":
+        await query.message.reply_text(
+            f"🔔 Alert for <b>{symbol}</b> will trigger on next high-quality setup.\n"
+            f"Auto-scan is {'ON ✅' if context.bot_data.get('alerts_on', True) else 'OFF 🔇'}",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 # ─── Scheduled auto-scan ─────────────────────────────────────────────────────
@@ -648,6 +891,9 @@ def main():
     ]
     for name, fn in handlers:
         app.add_handler(CommandHandler(name, fn))
+
+    # Inline keyboard callback handler
+    app.add_handler(CallbackQueryHandler(button_callback))
 
     try:
         app.run_polling(drop_pending_updates=True)

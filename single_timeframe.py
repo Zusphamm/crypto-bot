@@ -42,11 +42,10 @@ def _rsi_vote(close: pd.Series) -> Dict:
     r = rsi(close, 14).iloc[-1]
     if pd.isna(r):
         return {"vote": 0, "weight": 0.0, "rsi": None}
-    # Giữ đúng nguyên tắc: RSI > 50 bias bullish, < 50 bias bearish
-    # Cực trị > 70 (quá mua) hoặc < 30 (quá bán) → hạ trọng số vì dễ đảo chiều
-    if r > 70:
+    # Crypto-tuned thresholds: 75/25 for overbought/oversold (wider than equities)
+    if r > 75:
         return {"vote": 1, "weight": 0.5, "rsi": float(r), "note": "overbought"}
-    if r < 30:
+    if r < 25:
         return {"vote": -1, "weight": 0.5, "rsi": float(r), "note": "oversold"}
     if r > 55:
         return {"vote": 1, "weight": 1.0, "rsi": float(r)}
@@ -94,32 +93,34 @@ def _bollinger_vote(df: pd.DataFrame) -> Dict:
 def _ma_alignment_vote(close: pd.Series) -> Dict:
     info = ma_alignment_score(close)
     score = info["score"]
+    # Reduced weight (was 2.0/1.2) to prevent technical dominance
     if score >= 2:
-        return {"vote": 1, "weight": 2.0, **info}
+        return {"vote": 1, "weight": 1.5, **info}
     if score == 1:
-        return {"vote": 1, "weight": 1.2, **info}
+        return {"vote": 1, "weight": 1.0, **info}
     if score <= -2:
-        return {"vote": -1, "weight": 2.0, **info}
+        return {"vote": -1, "weight": 1.5, **info}
     if score == -1:
-        return {"vote": -1, "weight": 1.2, **info}
+        return {"vote": -1, "weight": 1.0, **info}
     return {"vote": 0, "weight": 0.3, **info}
 
 
 def _structure_vote(df: pd.DataFrame) -> Dict:
     info = market_structure(df, lookback=5)
     trend = info["trend"]
+    # Reduced weight (was 1.5) to prevent technical dominance
     if trend == "uptrend":
-        vote, weight = 1, 1.5
+        vote, weight = 1, 1.2
     elif trend == "downtrend":
-        vote, weight = -1, 1.5
+        vote, weight = -1, 1.2
     else:
         vote, weight = 0, 0.4
 
-    # BOS tăng trọng số
+    # BOS — dampened boost (was +0.8, now +0.5)
     if info.get("bos") and info.get("bos_direction") == "bullish":
-        vote, weight = 1, weight + 0.8
+        vote, weight = 1, weight + 0.5
     elif info.get("bos") and info.get("bos_direction") == "bearish":
-        vote, weight = -1, weight + 0.8
+        vote, weight = -1, weight + 0.5
 
     return {"vote": vote, "weight": weight, **info}
 
@@ -127,10 +128,11 @@ def _structure_vote(df: pd.DataFrame) -> Dict:
 def _ichimoku_vote(df: pd.DataFrame) -> Dict:
     icm = ichimoku(df)
     sig = ichimoku_signal(df, icm)
+    # Reduced weight (was 1.5) to prevent technical dominance
     if sig == 1:
-        return {"vote": 1, "weight": 1.5, "status": "above_cloud_bullish"}
+        return {"vote": 1, "weight": 1.2, "status": "above_cloud_bullish"}
     if sig == -1:
-        return {"vote": -1, "weight": 1.5, "status": "below_cloud_bearish"}
+        return {"vote": -1, "weight": 1.2, "status": "below_cloud_bearish"}
     return {"vote": 0, "weight": 0.5, "status": "inside_cloud"}
 
 
@@ -201,6 +203,76 @@ def _hurst_vote(df: pd.DataFrame) -> Dict:
 
 
 # -----------------------------------------------------------------------------
+# Counter-trend indicators (break positive feedback loop)
+# -----------------------------------------------------------------------------
+
+def _rsi_divergence_vote(df: pd.DataFrame) -> Dict:
+    """
+    RSI divergence: price makes new high but RSI doesn't (bearish divergence)
+    or price makes new low but RSI doesn't (bullish divergence).
+    Counter-trend signal to offset trend-following dominance.
+    """
+    close = df["close"]
+    r = rsi(close, 14)
+    if len(close) < 30 or pd.isna(r.iloc[-1]):
+        return {"vote": 0, "weight": 0.0, "divergence": "none"}
+
+    lookback = 20
+    price_window = close.iloc[-lookback:]
+    rsi_window = r.iloc[-lookback:]
+
+    # Bearish divergence: price at/near recent high, RSI lower
+    price_near_high = close.iloc[-1] >= price_window.quantile(0.9)
+    rsi_declining = r.iloc[-1] < rsi_window.quantile(0.7)
+
+    # Bullish divergence: price at/near recent low, RSI higher
+    price_near_low = close.iloc[-1] <= price_window.quantile(0.1)
+    rsi_rising = r.iloc[-1] > rsi_window.quantile(0.3)
+
+    if price_near_high and rsi_declining:
+        return {"vote": -1, "weight": 1.0, "divergence": "bearish",
+                "rsi": float(r.iloc[-1])}
+    if price_near_low and rsi_rising:
+        return {"vote": 1, "weight": 1.0, "divergence": "bullish",
+                "rsi": float(r.iloc[-1])}
+    return {"vote": 0, "weight": 0.2, "divergence": "none",
+            "rsi": float(r.iloc[-1])}
+
+
+def _bollinger_pctb_vote(df: pd.DataFrame) -> Dict:
+    """
+    Bollinger %B: measures where price is relative to the bands.
+    %B > 1.0 = above upper band (overextended), %B < 0 = below lower (oversold).
+    Counter-trend: extreme %B votes against the trend.
+    """
+    lo, mid, up = bollinger(df["close"])
+    if pd.isna(up.iloc[-1]) or pd.isna(lo.iloc[-1]):
+        return {"vote": 0, "weight": 0.0, "pct_b": None}
+
+    close = df["close"].iloc[-1]
+    band_width = up.iloc[-1] - lo.iloc[-1]
+    if band_width < 1e-10:
+        return {"vote": 0, "weight": 0.1, "pct_b": 0.5}
+
+    pct_b = (close - lo.iloc[-1]) / band_width
+
+    # Counter-trend: extreme %B signals mean-reversion
+    if pct_b > 1.0:
+        return {"vote": -1, "weight": 0.8, "pct_b": float(pct_b),
+                "note": "above_upper_band"}
+    if pct_b < 0.0:
+        return {"vote": 1, "weight": 0.8, "pct_b": float(pct_b),
+                "note": "below_lower_band"}
+    if pct_b > 0.8:
+        return {"vote": -1, "weight": 0.4, "pct_b": float(pct_b),
+                "note": "near_upper"}
+    if pct_b < 0.2:
+        return {"vote": 1, "weight": 0.4, "pct_b": float(pct_b),
+                "note": "near_lower"}
+    return {"vote": 0, "weight": 0.2, "pct_b": float(pct_b)}
+
+
+# -----------------------------------------------------------------------------
 # Main single-timeframe analyzer
 # -----------------------------------------------------------------------------
 
@@ -231,6 +303,9 @@ def analyze_timeframe(
         "hmm_regime": _hmm_vote(df),
         "kalman_trend": _kalman_vote(df),
         "hurst_memory": _hurst_vote(df),
+        # Counter-trend indicators to break positive feedback loop
+        "rsi_divergence": _rsi_divergence_vote(df),
+        "bollinger_pctb": _bollinger_pctb_vote(df),
     }
 
     # Weighted sum
@@ -252,10 +327,50 @@ def analyze_timeframe(
     if total_weight == 0:
         probs = {"up": 1/3, "down": 1/3, "neutral": 1/3}
     else:
+        # --- Agreement-based probability (fixes 100% bug) ---
+        # Count how many models agree on each direction
+        n_models = len(votes)
+        n_up = sum(1 for v in votes.values() if v["vote"] > 0)
+        n_down = sum(1 for v in votes.values() if v["vote"] < 0)
+        n_neutral = sum(1 for v in votes.values() if v["vote"] == 0)
+
+        # Agreement ratio: what fraction of models agree on majority direction
+        agreement_ratio = max(n_up, n_down, n_neutral) / n_models
+
+        # Weight-based score (clipped to [-1, 1])
+        raw_score = (score_up - score_down) / total_weight
+        raw_score = max(-1.0, min(1.0, raw_score))
+
+        # Blend: 60% agreement ratio + 40% score magnitude
+        score_magnitude = abs(raw_score)
+        blended = 0.6 * agreement_ratio + 0.4 * score_magnitude
+
+        # Convert to directional probabilities
+        if raw_score > 0:
+            p_up = 0.33 + blended * 0.52   # range: 0.33 → 0.85
+            p_down = (1.0 - p_up) * 0.4
+            p_neutral = 1.0 - p_up - p_down
+        elif raw_score < 0:
+            p_down = 0.33 + blended * 0.52
+            p_up = (1.0 - p_down) * 0.4
+            p_neutral = 1.0 - p_up - p_down
+        else:
+            p_up = score_up / total_weight
+            p_down = score_down / total_weight
+            p_neutral = 1.0 - p_up - p_down
+
+        # Hard ceiling at 85% — no trading model should output 100%
+        MAX_PROB = 0.85
+        p_up = min(p_up, MAX_PROB)
+        p_down = min(p_down, MAX_PROB)
+        p_neutral = max(p_neutral, 0.0)
+
+        # Renormalize
+        total_p = p_up + p_down + p_neutral
         probs = {
-            "up": score_up / total_weight,
-            "down": score_down / total_weight,
-            "neutral": score_neutral / total_weight,
+            "up": p_up / total_p,
+            "down": p_down / total_p,
+            "neutral": p_neutral / total_p,
         }
 
     # Kết luận

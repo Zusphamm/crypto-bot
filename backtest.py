@@ -96,7 +96,7 @@ def compute_empirical_hit_rate(
     df: pd.DataFrame,
     forward_bars: int = 10,
     min_move_pct: float = None,
-    use_mfe: bool = True,
+    use_mfe: bool = False,
 ) -> Dict:
     """
     Chạy vectorized signals trên toàn lịch sử, đánh dấu dự đoán,
@@ -257,7 +257,7 @@ def bayesian_adjusted_probability(
             "calibrated_probability": float(p),
             "baseline": float(baseline_up),
             "edge_vs_baseline": float(edge),
-            "has_edge": edge > 0.02,  # yêu cầu edge ≥ 2% mới gọi là "có skill"
+            "has_edge": edge > 0.05,  # yêu cầu edge ≥ 2% mới gọi là "có skill"
             "sample_size": hit_stats.get("n_up_signals"),
         }
     if current_vote == -1:
@@ -270,7 +270,7 @@ def bayesian_adjusted_probability(
             "calibrated_probability": float(p),
             "baseline": float(baseline_down),
             "edge_vs_baseline": float(edge),
-            "has_edge": edge > 0.02,
+            "has_edge": edge > 0.05,
             "sample_size": hit_stats.get("n_down_signals"),
         }
 
